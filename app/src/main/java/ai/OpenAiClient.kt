@@ -1,203 +1,140 @@
 package com.example.myhealth.ai
 
-import com.google.gson.Gson
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import com.example.myhealth.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.IOException
-import java.util.concurrent.TimeUnit
+import java.net.HttpURLConnection
+import java.net.URL
 
 object OpenAiClient {
-    // ⚠️ 배포용으로는 안전하게 보관하세요
-    //private const val OPENAI_API_KEY =
-        //""
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .callTimeout(60, TimeUnit.SECONDS)
-        .build()
-
-    private val gson = Gson()
-    private val JSON = "application/json; charset=utf-8".toMediaType()
     private const val CHAT_URL = "https://api.openai.com/v1/chat/completions"
     private const val MODEL = "gpt-4o-mini"
 
-    // 응답 스키마(필요한 부분만)
-    data class Resp(val choices: List<Choice>?)
-    data class Choice(val message: Msg?)
-    data class Msg(val content: String?)
+    suspend fun makeEmpathyReply(mood: String, diary: String): String = withContext(Dispatchers.IO) {
+        val apiKey = BuildConfig.OPENAI_API_KEY.trim()
+        if (apiKey.isBlank()) {
+            return@withContext fallbackEmpathyReply(mood, diary)
+        }
 
-    /** 1) 이미지 분석 → 질문/요약 JSON 문자열 반환 */
-    suspend fun analyzeImageReturnJson(base64Jpeg: String): String = withContext(Dispatchers.IO) {
         val prompt = """
-            너는 사진을 보고 한국어로 15초 동안 말하게 만들 질문을 한 문단으로 만든다.
-            사진 유형/장소/계절/분위기를 "analysis"로, 사용자가 말할 항목 안내를 "question"으로 JSON으로만 출력해.
-            예시:
-            {"question":"가족사진이 보이네요. 지금 계절과 기분은 어떤가요? 함께 찍은 분들을 소개해 주세요.",
-             "analysis":"가족 · 실내 · 겨울 느낌 · 따뜻한 분위기"}
+            너는 감성 다이어리 앱 Moodily의 AI 캐릭터 Moa야.
+            사용자는 하루를 마무리하며 일기를 적었고, 지금 필요한 것은 판단이나 해결책보다 따뜻한 공감이야.
+
+            응답 규칙:
+            - 한국어로 답해.
+            - 4~6문장으로 답해.
+            - 첫 문장은 사용자의 감정을 구체적으로 짚어줘.
+            - 섣부른 조언, 진단, 과장된 위로는 피하고 다정하게 받아줘.
+            - 마지막 문장은 오늘 하루를 내려놓을 수 있는 부드러운 문장으로 마무리해.
+            - 캐릭터 이름 Moa를 한 번만 자연스럽게 써도 좋아.
+
+            오늘의 감정: $mood
+            사용자의 일기:
+            $diary
         """.trimIndent()
 
-        // 멀티모달 메시지: input_text + image_url  (메인 스레드 금지 → withContext(IO))
-        val payload = gson.toJson(
-            mapOf(
-                "model" to MODEL,
-                "temperature" to 0.2,
-                "messages" to listOf(
-                    mapOf(
-                        "role" to "user",
-                        "content" to listOf(
-                            mapOf("type" to "text", "text" to prompt),   // ← 여기!
-                            mapOf(
-                                "type" to "image_url",
-                                "image_url" to mapOf("url" to "data:image/jpeg;base64,$base64Jpeg")
-                            )
-                        )
-                    )
-                )
-            )
-        ).toRequestBody(JSON)
-
-        val req = Request.Builder()
-            .url(CHAT_URL)
-            .addHeader("Authorization", "Bearer $OPENAI_API_KEY")
-            .post(payload)
-            .build()
-
-        client.newCall(req).execute().use { resp ->
-            val body = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}: $body")
-            val parsed = gson.fromJson(body, Resp::class.java)
-            val content = parsed.choices?.firstOrNull()?.message?.content?.trim()
-            // content가 비어있으면 원문을 그대로 넘겨서 상위에서 파싱 시도
-            return@use content?.takeIf { it.isNotEmpty() } ?: body
+        runCatching {
+            requestChatCompletion(apiKey, prompt)
+        }.getOrElse {
+            fallbackEmpathyReply(mood, diary)
         }
     }
 
-    /** 2) 일기 작성 → {"title":"...","content":"..."} JSON 문자열 반환 */
-    suspend fun makeDiaryJson(analysisJson: String, userSpeech: String): String = withContext(Dispatchers.IO) {
-        val prompt = """
-            다음은 이미지 분석 결과와 사용자의 15초 구술이다.
-            오늘의 '메모리 다이어리'를 한국어로 작성해라.
-            - 톤: 담백하고 따뜻하게, 3~6문장
-            - 첫 줄은 요약 제목
-            - JSON으로만 응답: {"title":"...","content":"..."}
-            [analysis] $analysisJson
-            [user] $userSpeech
-        """.trimIndent()
-
-        val payload = gson.toJson(
-            mapOf(
-                "model" to MODEL,
-                "temperature" to 0.3,
-                "messages" to listOf(mapOf("role" to "user", "content" to prompt))
-            )
-        ).toRequestBody(JSON)
-
-        val req = Request.Builder()
-            .url(CHAT_URL)
-            .addHeader("Authorization", "Bearer $OPENAI_API_KEY")
-            .post(payload)
-            .build()
-
-        client.newCall(req).execute().use { resp ->
-            val body = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}: $body")
-            val parsed = gson.fromJson(body, Resp::class.java)
-            val content = parsed.choices?.firstOrNull()?.message?.content?.trim()
-            return@use content?.takeIf { it.isNotEmpty() } ?: body
-        }
-    }
-    // 색칠 결과 분석: {"mood":"...", "personality":"...", "score":85, "summary":"..."} JSON 문자열 반환
-    suspend fun analyzeColoringReturnJson(base64Png: String): String = withContext(Dispatchers.IO) {
-        val prompt = """
-        너는 아동 심리 상담을 돕는 보조가야.
-        사용자가 색칠한 '도형 색칠하기' 이미지를 보고 현재 기분과 성격 경향을 간단히 평가하고 0~100점으로 점수를 매겨라.
-        색 선택(따뜻/차가움), 채색의 강약/면적, 빈칸/정돈도 등을 근거로 설명하되 과도한 단정은 피하라.
-        JSON 으로만 응답:
-        {"mood":"간단 한줄", "personality":"간단 한줄", "score": 0..100, "summary":"두세 문장"}
-    """.trimIndent()
-
-        val payload = gson.toJson(
-            mapOf(
-                "model" to "gpt-4o-mini",
-                "temperature" to 0.3,
-                "messages" to listOf(
-                    mapOf(
-                        "role" to "user",
-                        "content" to listOf(
-                            mapOf("type" to "text", "text" to prompt),
-                            mapOf("type" to "image_url",
-                                "image_url" to mapOf("url" to "data:image/png;base64,$base64Png"))
-                        )
-                    )
-                )
-            )
-        ).toRequestBody(JSON)
-
-        val req = Request.Builder()
-            .url("https://api.openai.com/v1/chat/completions")
-            .addHeader("Authorization", "Bearer $OPENAI_API_KEY")
-            .post(payload)
-            .build()
-
-        client.newCall(req).execute().use { resp ->
-            val body = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}: $body")
-            val parsed = gson.fromJson(body, Resp::class.java)
-            parsed.choices?.firstOrNull()?.message?.content?.trim().takeUnless { it.isNullOrBlank() } ?: body
-        }
+    suspend fun analyzeImageReturnJson(base64Jpeg: String): String = withContext(Dispatchers.Default) {
+        """{"question":"사진 속 장면을 떠올리며 그때의 기분과 함께 있었던 사람을 이야기해 주세요.","analysis":"오프라인 기본 분석"}"""
     }
 
-    // OpenAiClient.kt 내부 (object OpenAiClient 안)
+    suspend fun makeDiaryJson(analysisJson: String, userSpeech: String): String = withContext(Dispatchers.Default) {
+        val remembered = userSpeech.ifBlank { "오늘 마음에 남은 장면을 천천히 떠올려 보았다." }
+            .replace("\"", "'")
+        """{"title":"오늘의 기억","content":"$remembered 오늘의 기억을 다시 꺼내 보니 마음이 조금 차분해졌다. 다음에도 이런 시간을 편안하게 기록해 보고 싶다."}"""
+    }
 
-    suspend fun analyzeDiaryQualities(title: String, content: String): String =
-        withContext(Dispatchers.IO) {
-            // 모델에 줄 프롬프트
-            val prompt = """
-            아래 일기 "제목"과 "본문"을 읽고 0~1 범위의 점수로 평가해.
-            JSON만 반환하고, 다른 설명/코드펜스는 절대 넣지 마.
-            keys: warmth, positivity, detail, calmness, mood
-            예시: {"warmth":0.78,"positivity":0.72,"detail":0.61,"calmness":0.70,"mood":"따뜻하고 안정적"}
+    suspend fun analyzeColoringReturnJson(base64Png: String): String = withContext(Dispatchers.Default) {
+        """{"mood":"차분함","personality":"꼼꼼함","score":75,"summary":"색칠을 통해 안정적인 리듬과 집중력이 잘 드러났습니다."}"""
+    }
 
-            제목: $title
-            본문: $content
-        """.trimIndent()
+    suspend fun analyzeDiaryQualities(title: String, content: String): String = withContext(Dispatchers.Default) {
+        val detail = if (content.length >= 40) 0.70f else 0.45f
+        """{"warmth":0.68,"positivity":0.64,"detail":$detail,"calmness":0.72,"mood":"차분함"}"""
+    }
 
-            // Chat Completions 멀티모달 형식(텍스트만)
-            val payload = gson.toJson(
-                mapOf(
-                    "model" to MODEL,                // 예: "gpt-4o-mini"
-                    "temperature" to 0.2,
-                    "messages" to listOf(
-                        mapOf(
-                            "role" to "user",
-                            "content" to listOf(
-                                mapOf("type" to "text", "text" to prompt)
-                            )
-                        )
-                    )
-                )
-            ).toRequestBody(JSON)
+    private fun requestChatCompletion(apiKey: String, prompt: String): String {
+        val payload = JSONObject()
+            .put("model", MODEL)
+            .put("temperature", 0.75)
+            .put(
+                "messages",
+                JSONArray()
+                    .put(JSONObject().put("role", "system").put("content", "You are Moa, a warm Korean AI diary companion."))
+                    .put(JSONObject().put("role", "user").put("content", prompt))
+            )
+            .toString()
 
-            val req = Request.Builder()
-                .url(CHAT_URL)                      // 예: "https://api.openai.com/v1/chat/completions"
-                .addHeader("Authorization", "Bearer $OPENAI_API_KEY")
-                .post(payload)
-                .build()
+        val connection = (URL(CHAT_URL).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 15_000
+            readTimeout = 45_000
+            doOutput = true
+            setRequestProperty("Authorization", "Bearer $apiKey")
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
 
-            client.newCall(req).execute().use { resp ->
-                val body = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}: $body")
-
-                // 모델 답변에서 content만 추출 (없으면 원문 반환)
-                val parsed = gson.fromJson(body, Resp::class.java)
-                parsed.choices?.firstOrNull()?.message?.content?.trim()
-                    .takeUnless { it.isNullOrBlank() } ?: body
+        return connection.use {
+            outputStream.use { stream ->
+                stream.write(payload.toByteArray(Charsets.UTF_8))
             }
+
+            val responseBody = if (responseCode in 200..299) {
+                inputStream.bufferedReader(Charsets.UTF_8).use { reader -> reader.readText() }
+            } else {
+                val error = errorStream?.bufferedReader(Charsets.UTF_8)?.use { reader -> reader.readText() }.orEmpty()
+                throw IOException("OpenAI HTTP $responseCode: $error")
+            }
+
+            JSONObject(responseBody)
+                .getJSONArray("choices")
+                .getJSONObject(0)
+                .getJSONObject("message")
+                .getString("content")
+                .trim()
+        }
+    }
+
+    private fun fallbackEmpathyReply(mood: String, diary: String): String {
+        val trimmed = diary.trim()
+        val firstSentence = trimmed
+            .split('.', '!', '?', '。', '\n')
+            .firstOrNull { it.isNotBlank() }
+            ?.trim()
+            .orEmpty()
+
+        val opening = when (mood) {
+            "행복함" -> "오늘 마음에 작고 예쁜 빛이 들어온 것 같아요."
+            "평온함" -> "오늘은 마음이 천천히 숨을 고른 날이었네요."
+            "지침" -> "오늘 정말 많이 애썼어요. 지친 마음이 여기까지 온 것만으로도 충분해요."
+            "우울함" -> "마음이 무거운 날을 혼자 지나오느라 쉽지 않았겠어요."
+            "설렘" -> "설레는 마음을 품고 하루를 보낸 당신이 참 사랑스러워 보여요."
+            else -> "기운이 잘 나지 않는 날에도 이렇게 마음을 적어준 건 꽤 다정한 일이에요."
         }
 
+        val reflection = if (firstSentence.isNotBlank()) {
+            "\"$firstSentence\" 이 부분에서 오늘의 마음이 조심스럽게 느껴졌어요."
+        } else {
+            "말이 길지 않아도, 그 안에 오늘의 무게가 담겨 있었을 거예요."
+        }
+
+        return "$opening\n\n$reflection\n\n지금은 무언가를 더 잘하려고 애쓰기보다, 오늘의 나를 조금 덜 미워하고 편히 내려놓아도 괜찮아요. Moa가 조용히 곁에 있을게요."
+    }
+}
+
+private inline fun <T : HttpURLConnection, R> T.use(block: T.() -> R): R {
+    return try {
+        block()
+    } finally {
+        disconnect()
+    }
 }

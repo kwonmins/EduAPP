@@ -1,11 +1,18 @@
-@file:OptIn(ExperimentalMaterial3Api::class)
+﻿@file:OptIn(ExperimentalMaterial3Api::class)
 
 package com.example.myhealth.ui
 
-import android.app.Application
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -13,19 +20,34 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.Divider
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import com.example.myhealth.ai.OpenAiClient
-import com.example.myhealth.session.DirectDbRepository
-import com.example.myhealth.session.DirectDbRepository.DailySummaryRow
-import com.example.myhealth.session.SessionDataStore
+import com.example.myhealth.session.LocalSessionRepository
+import com.example.myhealth.session.LocalSessionRepository.DailySummaryRow
 import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.YearMonth
@@ -33,92 +55,43 @@ import kotlin.math.roundToInt
 
 @Composable
 fun SummaryCalendarScreen() {
-    val ctx = LocalContext.current
-    val app = ctx.applicationContext as Application
-    val session = remember { SessionDataStore(app) }
-    val loginId by session.userIdFlow.collectAsState(initial = null)
-    val repo = remember { DirectDbRepository() }
+    val repo = remember { LocalSessionRepository() }
     val snack = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-
-    // ===== 요약 점수 상태 =====
-    var emotion by remember { mutableStateOf<Int?>(null) }
-    var cognition by remember { mutableStateOf<Int?>(null) }
-    var memory by remember { mutableStateOf<Int?>(null) }
-    var total by remember { mutableStateOf<Int?>(null) }
-    var wordScore by remember { mutableStateOf(0) }
-    var diaryScore by remember { mutableStateOf(0) }
-    var colorScore by remember { mutableStateOf(0) }
-    var loading by remember { mutableStateOf(false) }
-
-    // ===== 달력 상태 =====
     var ym by remember { mutableStateOf(YearMonth.now()) }
     var rows by remember { mutableStateOf(emptyList<DayCell>()) }
     var selected by remember { mutableStateOf<DayCell?>(null) }
+    var score by remember { mutableStateOf(DaySummary()) }
+    var loading by remember { mutableStateOf(false) }
 
-    fun refreshMonth(selectToday: Boolean = false) {
-        scope.launch {
-            val start = ym.atDay(1)
-            val end = ym.atEndOfMonth()
-            val list = repo.getDailySummaries(loginId, start, end)
-            val built = buildMonthCells(ym, list)
-            rows = built
-            if (selectToday) {
-                val today = LocalDate.now()
-                selected = built.firstOrNull { it.date == today }
-            }
-        }
+    suspend fun recalculate(): DaySummary {
+        val word = repo.getLastWord()
+        val diary = repo.getLastDiary()
+        val color = repo.getLastColoring()
+        val wordScore = word?.let { scoreWordChain(it.avgLatencyMs, it.validRatio, it.rounds) } ?: 0
+        val diaryScore = diary?.content?.let { scoreDiary(it) } ?: 0
+        val colorScore = color?.score ?: 0
+        val emotion = ((diaryScore * 0.55f) + (colorScore * 0.45f)).roundToInt().coerceIn(0, 100)
+        val cognition = wordScore
+        val memory = ((wordScore * 0.45f) + (diaryScore * 0.55f)).roundToInt().coerceIn(0, 100)
+        val total = ((wordScore + diaryScore + colorScore) / 3f).roundToInt().coerceIn(0, 100)
+        return DaySummary(total, wordScore, diaryScore, colorScore, emotion, cognition, memory)
     }
 
-    // ===== 요약 계산 =====
-    LaunchedEffect(loginId) {
-        loading = true
-        try {
-            val word = repo.getLastWord(loginId)
-            val diary = repo.getLastDiary(loginId)
-            val color = repo.getLastColoring(loginId)
-
-            // 끝말잇기 점수
-            wordScore = word?.let { scoreWordChain(it.avgLatencyMs, it.validRatio, it.rounds) } ?: 0
-
-            // Pair에 타입 먼저 지정 후 구조분해
-            val result: Pair<Int, DiaryQual> =
-                if (diary != null && diary.content.isNotBlank()) {
-                    scoreDiary(diary.title, diary.content)
-                } else {
-                    Pair(0, DiaryQual(0f, 0f, 0f, 0f, null))
-                }
-            val (dScore, dq) = result
-            diaryScore = dScore
-
-            // 색칠 점수
-            colorScore = color?.score ?: 0
-
-            // 파생 지표
-            val emotionPct = (0.6f * ((dq.warmth + dq.positivity) / 2f) + 0.4f * (colorScore / 100f))
-                .coerceIn(0f, 1f)
-            val cognitionPct = (0.7f * (wordScore / 100f) + 0.3f * dq.detail)
-                .coerceIn(0f, 1f)
-            val memoryPct = (0.5f * (word?.validRatio ?: 0f) + 0.5f * dq.detail)
-                .coerceIn(0f, 1f)
-
-            emotion = (emotionPct * 100f).roundToInt()
-            cognition = (cognitionPct * 100f).roundToInt()
-            memory = (memoryPct * 100f).roundToInt()
-
-            val base = 0.35f * diaryScore + 0.35f * colorScore + 0.30f * wordScore
-            val warmSynergy = dq.warmth.coerceAtMost(0.5f) * 6f
-            val calmSynergy = dq.calmness.coerceAtMost(0.7f) * 4f
-            total = (base + warmSynergy + calmSynergy).roundToInt().coerceIn(0, 100)
-        } catch (e: Throwable) {
-            snack.showSnackbar("요약 계산 실패: ${e.localizedMessage}")
-        } finally {
-            loading = false
-        }
+    suspend fun refreshMonth(selectToday: Boolean = false) {
+        val monthRows = repo.getDailySummaries(ym.atDay(1), ym.atEndOfMonth())
+        val built = buildMonthCells(ym, monthRows)
+        rows = built
+        if (selectToday) selected = built.firstOrNull { it.date == LocalDate.now() }
     }
 
-    // 달력 초기 로드
-    LaunchedEffect(ym, loginId) { refreshMonth() }
+    LaunchedEffect(Unit) {
+        score = recalculate()
+    }
+
+    LaunchedEffect(ym) {
+        refreshMonth()
+    }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snack) },
@@ -127,43 +100,40 @@ fun SummaryCalendarScreen() {
                 title = { Text("오늘의 요약") },
                 actions = {
                     IconButton(onClick = { ym = ym.minusMonths(1) }) {
-                        Icon(Icons.Filled.ChevronLeft, contentDescription = null)
+                        Icon(Icons.Filled.ChevronLeft, contentDescription = "이전 달")
                     }
                     Text("${ym.year}.${ym.monthValue}", modifier = Modifier.padding(horizontal = 6.dp))
                     IconButton(onClick = { ym = ym.plusMonths(1) }) {
-                        Icon(Icons.Filled.ChevronRight, contentDescription = null)
+                        Icon(Icons.Filled.ChevronRight, contentDescription = "다음 달")
                     }
                 }
             )
         }
     ) { inner ->
         Column(
-            Modifier
+            modifier = Modifier
                 .padding(inner)
                 .fillMaxSize()
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // ===== 요약 카드 =====
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                shape = RoundedCornerShape(16.dp)
             ) {
                 Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("총 점수", style = MaterialTheme.typography.labelLarge)
-                    Spacer(Modifier.height(6.dp))
-                    Text((total ?: 0).toString(), style = MaterialTheme.typography.displaySmall)
-                    Text(summaryBadge(total ?: 0))
+                    Text("총점", style = MaterialTheme.typography.labelLarge)
+                    Text(score.total.toString(), style = MaterialTheme.typography.displaySmall)
+                    Text(summaryBadge(score.total), color = MaterialTheme.colorScheme.secondary)
                 }
             }
 
             Spacer(Modifier.height(12.dp))
-            ScoreRow("정서 상태", emotion ?: 0)
+            ScoreRow("정서 상태", score.emotion)
             Spacer(Modifier.height(8.dp))
-            ScoreRow("인지 상태", cognition ?: 0)
+            ScoreRow("인지 상태", score.cognition)
             Spacer(Modifier.height(8.dp))
-            ScoreRow("기억 상태", memory ?: 0)
+            ScoreRow("기억 상태", score.memory)
             Spacer(Modifier.height(12.dp))
 
             Button(
@@ -171,48 +141,35 @@ fun SummaryCalendarScreen() {
                 onClick = {
                     scope.launch {
                         loading = true
-                        try {
-                            val today = LocalDate.now()
-                            val r = repo.upsertDailySummary(
-                                loginId = loginId,
-                                date = today,
-                                total = total ?: 0,
-                                word = wordScore,
-                                diary = diaryScore,
-                                color = colorScore,
-                                emotion = emotion ?: 0,
-                                cognition = cognition ?: 0,
-                                memory = memory ?: 0,
-                                detailJson = null
-                            )
-                            if (r.isFailure) {
-                                snack.showSnackbar("저장 실패(달력은 갱신): ${r.exceptionOrNull()?.localizedMessage}")
-                            }
-                            if (YearMonth.from(today) == ym) {
-                                refreshMonth(selectToday = true)
-                            } else {
-                                ym = YearMonth.from(today)
-                                refreshMonth(selectToday = true)
-                            }
-                        } finally {
-                            loading = false
-                        }
+                        score = recalculate()
+                        val today = LocalDate.now()
+                        repo.upsertDailySummary(
+                            date = today,
+                            total = score.total,
+                            word = score.word,
+                            diary = score.diary,
+                            color = score.color,
+                            emotion = score.emotion,
+                            cognition = score.cognition,
+                            memory = score.memory,
+                            detailJson = null
+                        )
+                        ym = YearMonth.from(today)
+                        refreshMonth(selectToday = true)
+                        loading = false
+                        snack.showSnackbar("오늘 요약을 저장했습니다.")
                     }
                 }
-            ) { Text("적용으로") }
+            ) {
+                Text(if (loading) "저장 중..." else "오늘 요약 저장")
+            }
 
             Spacer(Modifier.height(18.dp))
             Divider()
             Spacer(Modifier.height(8.dp))
 
-            // ===== 달력 =====
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                listOf("일","월","화","수","목","금","토").forEach {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                listOf("일", "월", "화", "수", "목", "금", "토").forEach {
                     Text(it, modifier = Modifier.width(36.dp), textAlign = TextAlign.Center)
                 }
             }
@@ -221,44 +178,25 @@ fun SummaryCalendarScreen() {
                 columns = GridCells.Fixed(7),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(bottom = 8.dp),
                 modifier = Modifier.weight(1f)
             ) {
                 items(rows) { cell ->
-                    DayBox(cell) {
-                        selected = cell.takeIf { it.date != null && it.summary != null }
-                    }
+                    DayBox(cell) { selected = cell.takeIf { it.summary != null } }
                 }
             }
 
-            // 선택한 날 상세
-            if (selected?.summary != null) {
-                val s = selected!!.summary!!
+            selected?.summary?.let { summary ->
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(14.dp)) {
-                        Text("${selected!!.date}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.height(6.dp))
-                        BreakdownRow("정서", s.emotion)
-                        Spacer(Modifier.height(6.dp))
-                        BreakdownRow("인지", s.cognition)
-                        Spacer(Modifier.height(6.dp))
-                        BreakdownRow("기억", s.memory)
+                        Text(selected?.date.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(8.dp))
-                        Divider()
-                        Spacer(Modifier.height(8.dp))
-                        SmallRow("끝말잇기", s.word)
-                        SmallRow("일기", s.diary)
-                        SmallRow("색칠", s.color)
-                        Spacer(Modifier.height(6.dp))
-                        Text("총점: ${s.total}점", fontWeight = FontWeight.SemiBold)
+                        Text("총점 ${summary.total}점 · 끝말잇기 ${summary.word}점 · 일기 ${summary.diary}점 · 색칠 ${summary.color}점")
                     }
                 }
             }
         }
     }
 }
-
-/* ================== 공용 UI/로직 ================== */
 
 @Composable
 private fun ScoreRow(title: String, score: Int) {
@@ -268,19 +206,14 @@ private fun ScoreRow(title: String, score: Int) {
             Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 LinearProgressIndicator(
-                    progress = (score.coerceIn(0, 100) / 100f),
+                    progress = { score.coerceIn(0, 100) / 100f },
                     modifier = Modifier
                         .weight(1f)
                         .height(10.dp),
-                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
-                    color = when (score) {
-                        in 0..59 -> Color(0xFFE53935)
-                        in 60..79 -> Color(0xFFFFA000)
-                        else -> Color(0xFF43A047)
-                    }
+                    color = totalColor(score)
                 )
                 Spacer(Modifier.width(12.dp))
-                Text("${score}점", textAlign = TextAlign.End, modifier = Modifier.width(56.dp), fontWeight = FontWeight.SemiBold)
+                Text("${score}점", modifier = Modifier.width(56.dp), textAlign = TextAlign.End, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -288,56 +221,71 @@ private fun ScoreRow(title: String, score: Int) {
 
 @Composable
 private fun DayBox(cell: DayCell, onClick: () -> Unit) {
-    val bg = if (cell.summary != null) totalColor(cell.summary.total) else Color.Transparent
-    val alpha = if (cell.summary != null) 0.15f else 0f
+    val summary = cell.summary
     Column(
         modifier = Modifier
             .width(36.dp)
             .height(48.dp)
-            .background(bg.copy(alpha = alpha), shape = MaterialTheme.shapes.small)
-            .clickable(enabled = cell.summary != null) { onClick() }
+            .background(
+                color = summary?.let { totalColor(it.total).copy(alpha = 0.15f) } ?: Color.Transparent,
+                shape = MaterialTheme.shapes.small
+            )
+            .clickable(enabled = summary != null) { onClick() }
             .padding(4.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween
     ) {
         Text(cell.label, style = MaterialTheme.typography.labelLarge)
-        if (cell.summary != null) {
-            Text(
-                "${cell.summary.total}",
-                style = MaterialTheme.typography.labelSmall,
-                color = totalColor(cell.summary.total),
-                fontWeight = FontWeight.Bold
-            )
+        if (summary != null) {
+            Text(summary.total.toString(), color = totalColor(summary.total), fontWeight = FontWeight.Bold)
         } else {
             Spacer(Modifier.height(6.dp))
         }
     }
 }
 
-@Composable
-private fun BreakdownRow(title: String, score: Int) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(title, modifier = Modifier.width(56.dp))
-        LinearProgressIndicator(
-            progress = score.coerceIn(0, 100) / 100f,
-            modifier = Modifier
-                .weight(1f)
-                .height(10.dp),
-            color = totalColor(score),
-            trackColor = MaterialTheme.colorScheme.surface
+private data class DayCell(val date: LocalDate?, val label: String, val summary: DaySummary?)
+private data class DaySummary(
+    val total: Int = 0,
+    val word: Int = 0,
+    val diary: Int = 0,
+    val color: Int = 0,
+    val emotion: Int = 0,
+    val cognition: Int = 0,
+    val memory: Int = 0
+)
+
+private fun buildMonthCells(ym: YearMonth, summaries: List<DailySummaryRow>): List<DayCell> {
+    val byDate = summaries.associateBy { it.date }
+    val first = ym.atDay(1)
+    val leading = first.dayOfWeek.value % 7
+    val cells = mutableListOf<DayCell>()
+    repeat(leading) { cells += DayCell(null, "", null) }
+    for (day in 1..ym.lengthOfMonth()) {
+        val date = ym.atDay(day)
+        val row = byDate[date]
+        cells += DayCell(
+            date = date,
+            label = day.toString(),
+            summary = row?.let { DaySummary(it.total, it.word, it.diary, it.color, it.emotion, it.cognition, it.memory) }
         )
-        Spacer(Modifier.width(8.dp))
-        Text("${score}점", fontWeight = FontWeight.SemiBold)
     }
+    while (cells.size % 7 != 0) cells += DayCell(null, "", null)
+    return cells
 }
 
-@Composable
-private fun SmallRow(title: String, score: Int) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(title, modifier = Modifier.width(64.dp))
-        Spacer(Modifier.width(6.dp))
-        Text("${score}점", fontWeight = FontWeight.Medium, color = totalColor(score))
-    }
+private fun scoreWordChain(avgLatencyMs: Int, validRatio: Float, roundsCompleted: Int): Int {
+    val speed = ((3000f - avgLatencyMs) / 2500f).coerceIn(0f, 1f)
+    val accuracy = validRatio.coerceIn(0f, 1f)
+    val completion = (roundsCompleted / 5f).coerceIn(0f, 1f)
+    return (100f * (0.5f * speed + 0.4f * accuracy + 0.1f * completion)).roundToInt().coerceIn(0, 100)
+}
+
+private fun scoreDiary(content: String): Int = when {
+    content.length >= 80 -> 90
+    content.length >= 40 -> 78
+    content.length >= 15 -> 64
+    else -> 45
 }
 
 private fun totalColor(score: Int) = when (score) {
@@ -346,83 +294,9 @@ private fun totalColor(score: Int) = when (score) {
     else -> Color(0xFF43A047)
 }
 
-private data class DayCell(val date: LocalDate?, val label: String, val summary: DaySummary?)
-private data class DaySummary(
-    val total: Int, val word: Int, val diary: Int, val color: Int,
-    val emotion: Int, val cognition: Int, val memory: Int
-)
-
-private fun buildMonthCells(ym: YearMonth, rows: List<DailySummaryRow>): List<DayCell> {
-    val map = rows.associateBy { it.date }
-    val first = ym.atDay(1)
-    val leading = (first.dayOfWeek.value) % 7 // Mon=1..Sun=7 → Sun=0
-    val totalDays = ym.lengthOfMonth()
-    val list = mutableListOf<DayCell>()
-    repeat(leading) { list += DayCell(null, "", null) }
-    for (d in 1..totalDays) {
-        val date = ym.atDay(d)
-        val row = map[date]
-        val summary = row?.let {
-            DaySummary(
-                total = it.total, word = it.word, diary = it.diary, color = it.color,
-                emotion = it.emotion, cognition = it.cognition, memory = it.memory
-            )
-        }
-        list += DayCell(date, d.toString(), summary)
-    }
-    while (list.size % 7 != 0) list += DayCell(null, "", null)
-    return list
-}
-
-/* ---- 점수 계산 로직 ---- */
-
-private fun scoreWordChain(
-    avgLatencyMs: Int,
-    validRatio: Float,
-    roundsCompleted: Int,
-    targetRounds: Int = 5
-): Int {
-    val speed = ((3000f - avgLatencyMs) / (3000f - 500f)).coerceIn(0f, 1f)
-    val accuracy = validRatio.coerceIn(0f, 1f)
-    val completion = (roundsCompleted.toFloat() / targetRounds).coerceIn(0f, 1f)
-    return (100f * (0.5f * speed + 0.4f * accuracy + 0.1f * completion)).toInt().coerceIn(0, 100)
-}
-
 private fun summaryBadge(total: Int) = when {
-    total >= 90 -> "매우 훌륭해요 🌟"
-    total >= 75 -> "아주 좋아요 🙂"
-    total >= 60 -> "좋은 하루였어요 😊"
-    else -> "차분히 한 걸음씩 🚶"
-}
-
-/* ---------- 일기 분석(공유 유틸) ---------- */
-
-data class DiaryQual(
-    val warmth: Float,
-    val positivity: Float,
-    val detail: Float,
-    val calmness: Float,
-    val mood: String?
-)
-
-private fun parseDiaryQual(json: String) = DiaryQual(
-    Regex(""""warmth"\s*:\s*(\d(\.\d+)?)""").find(json)?.groupValues?.get(1)?.toFloat() ?: 0f,
-    Regex(""""positivity"\s*:\s*(\d(\.\d+)?)""").find(json)?.groupValues?.get(1)?.toFloat() ?: 0f,
-    Regex(""""detail"\s*:\s*(\d(\.\d+)?)""").find(json)?.groupValues?.get(1)?.toFloat() ?: 0f,
-    Regex(""""calmness"\s*:\s*(\d(\.\d+)?)""").find(json)?.groupValues?.get(1)?.toFloat() ?: 0f,
-    Regex(""""mood"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
-)
-
-private suspend fun scoreDiary(title: String, content: String): Pair<Int, DiaryQual> {
-    val json = OpenAiClient.analyzeDiaryQualities(title, content)
-    val q = parseDiaryQual(json)
-    val base = 100f * (0.4f * q.warmth + 0.3f * q.positivity + 0.2f * q.detail + 0.1f * q.calmness)
-    val len = content.length
-    val penalty = when {
-        len < 20 -> -20
-        len < 40 -> -10
-        else -> 0
-    }
-    val score = ((base + penalty).coerceIn(0f, 100f)).toInt()
-    return Pair(score, q)
+    total >= 85 -> "아주 좋아요"
+    total >= 70 -> "좋은 흐름이에요"
+    total >= 55 -> "천천히 이어가면 좋아요"
+    else -> "가볍게 다시 시작해 볼까요"
 }
